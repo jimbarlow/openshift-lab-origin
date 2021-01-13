@@ -1,0 +1,820 @@
+= Building and publishing a Gitea Operator using the Ansible Operator SDK 1.3
+
+== Install Operator SDK
+
+[NOTE]
+The following instructions have been written for RHEL 8. But this entire process also works on macOS - and where appropriate the necessary adjustments and commands have been provided.
+
+In order to build an operator you need to install the Operator SDK binaries on your machine. The current release is 1.2.0 (as of 2020/11/17). In order to follow this lab it is recommended you stick to this release as future updates may break the process. This lab will be updated on a best effort basis up to keep up with Operator SDK releases.
+
+. Install the Operator SDK on your machine:
++
+.Linux
+[source,sh]
+----
+RELEASE_VERSION=v1.3.0
+
+curl -L https://github.com/operator-framework/operator-sdk/releases/download/$RELEASE_VERSION/operator-sdk_linux_amd64 -o operator-sdk
+curl -L https://github.com/operator-framework/operator-sdk/releases/download/$RELEASE_VERSION/ansible-operator_linux_amd64 -o ansible-operator
+curl -L https://github.com/operator-framework/operator-sdk/releases/download/$RELEASE_VERSION/helm-operator_linux_amd64 -o helm-operator
+
+chmod +x operator-sdk ansible-operator helm-operator
+
+sudo chown root:root operator-sdk ansible-operator helm-operator
+sudo mv operator-sdk ansible-operator helm-operator /usr/local/bin
+----
++
+.MacOS
+[source,sh]
+----
+RELEASE_VERSION=v1.3.0
+
+curl -L https://github.com/operator-framework/operator-sdk/releases/download/$RELEASE_VERSION/operator-sdk_darwin_amd64 -o operator-sdk
+curl -L https://github.com/operator-framework/operator-sdk/releases/download/$RELEASE_VERSION/ansible-operator_darwin_amd64 -o ansible-operator
+curl -L https://github.com/operator-framework/operator-sdk/releases/download/$RELEASE_VERSION/helm-operator_darwin_amd64 -o helm-operator
+
+chmod +x operator-sdk ansible-operator helm-operator
+
+mv operator-sdk ansible-operator helm-operator ~/bin
+----
+
+. Set up a Python 3 virtualenv with ansible tools and the OpenShift and Kubernetes Python libraries.
++
+[NOTE]
+You may need to install `virtualenv` on a system level first using `pip3 install virtualenv`. You may also need to install `gcc`, `make` and `python3-devel` on the Linux system first.
++
+[source,sh]
+----
+# For Linux (RHEL 8) only
+sudo yum -y install gcc python3-devel virtualenv make
+
+# For all platforms
+virtualenv -p $(which python3) ~/virtualenvs/ansible-operator
+source ~/virtualenvs/ansible-operator/bin/activate
+pip install -U pip
+pip install ansible==2.9.16
+pip install ansible-runner==1.4.6
+pip install ansible-runner-http==1.0.0
+pip install kubernetes==11.0.0
+pip install openshift==0.11.2
+
+# Install Kubernetes Collection
+ansible-galaxy collection install community.kubernetes
+# Install Operator SDK Util collection
+ansible-galaxy collection install operator_sdk.util
+----
+
+== Create the Gitea operator
+
+The Ansible logic for the operator has already been written. You simply take the roles and the associated playbook and turn them into an Ansible Operator.
+
+. Clone the repository containing the roles:
++
+[source,sh]
+----
+cd $HOME
+git clone https://github.com/redhat-gpte-devopsautomation/ansible-operator-roles
+cd ansible-operator-roles
+# git checkout v1.3.0
+cd $HOME
+----
+
+. Create new operator directory and initialize it
++
+[source,sh]
+----
+mkdir $HOME/gitea-operator
+cd $HOME/gitea-operator
+operator-sdk init --plugins=ansible.sdk.operatorframework.io/v1 --domain=opentlc.com
+operator-sdk create api --group gpte --version v1 --kind Gitea --generate-playbook
+----
+
+. Replace the playbook and roles with the ones you cloned before:
++
+[source,sh]
+----
+rm -rf roles/* playbooks/*
+cp -R $HOME/ansible-operator-roles/roles/postgresql-ocp ./roles
+cp -R $HOME/ansible-operator-roles/roles/gitea-ocp ./roles
+cp $HOME/ansible-operator-roles/playbooks/gitea.yaml ./playbooks/gitea.yml
+----
+
+. Examine the `watches.yaml` file:
++
+[source,sh]
+----
+cat ./watches.yaml
+----
++
+.Sample Output
+[source,texinfo]
+----
+---
+# Use the 'create api' subcommand to add watches to this file.
+- version: v1
+  group: gpte.opentlc.com
+  kind: Gitea
+  playbook: playbooks/gitea.yml
+# +kubebuilder:scaffold:watch
+----
++
+This is the main configuration for the Ansible Operator. The group, version, and kind come from the command you used to create the skeleton. The playbook uses the `gitea.yml` filename. In the next step, you see how the file ends up in the `/opt/ansible` location.
+
+. Examine the Dockerfile in the operator directory:
++
+[source,sh]
+----
+cat Dockerfile
+----
++
+.Sample Output
+[source,texinfo]
+----
+FROM quay.io/operator-framework/ansible-operator:v1.3.0
+
+COPY requirements.yml ${HOME}/requirements.yml
+RUN ansible-galaxy collection install -r ${HOME}/requirements.yml \
+ && chmod -R ug+rwx ${HOME}/.ansible
+
+COPY watches.yaml ${HOME}/watches.yaml
+COPY roles/ ${HOME}/roles/
+COPY playbooks/ ${HOME}/playbooks/
+----
++
+Note the source image for the container image that is being built and observe that all the Dockerfile does is copy the roles, playbook, and watches files into the container image.
+
+== Deploy the CRD
+
+The next step is to deploy the Custom Resource Definition into the cluster. Without the CRD OpenShift does not know that the object to be managed by your operator exists.
+
+. Make sure you are logged into OpenShift as a user with `cluster-admin` permissions.
++
+[source,sh]
+----
+oc login -u <user with cluster-admin privileges>
+----
+
+. Deploy the CRD:
++
+[source,sh]
+----
+make install
+----
++
+.Sample Output
+[source,texinfo]
+----
+./bin/kustomize build config/crd | kubectl apply -f -
+customresourcedefinition.apiextensions.k8s.io/giteas.gpte.opentlc.com created
+----
+
+== Test the operator
+
+The Operator SDK contains capabilities to test your operator without having to build the operator container image or deploying the operator to the cluster. This is a really convenient capability while developing and testing your operator.
+
+. Run the operator from your local machine
++
+[source,sh]
+----
+make run
+----
++
+.Sample Output
+[source,texinfo]
+----
+/usr/local/bin/ansible-operator run
+{"level":"info","ts":1609951710.8546,"logger":"cmd","msg":"Version","Go Version":"go1.15.5","GOOS":"darwin","GOARCH":"amd64","ansible-operator":"v1.3.0","commit":"1abf57985b43bf6a59dcd18147b3c574fa57d3f6"}
+{"level":"info","ts":1609951710.861252,"logger":"cmd","msg":"WATCH_NAMESPACE environment variable not set. Watching all namespaces.","Namespace":""}
+I0106 11:48:32.192439   89040 request.go:645] Throttling request took 1.000704535s, request: GET:https://api.cluster-wkosp.dynamic.opentlc.com:6443/apis/security.openshift.io/v1?timeout=32s
+{"level":"info","ts":1609951714.194839,"logger":"controller-runtime.metrics","msg":"metrics server is starting to listen","addr":":8080"}
+{"level":"info","ts":1609951714.197292,"logger":"watches","msg":"Environment variable not set; using default value","envVar":"ANSIBLE_VERBOSITY_GITEA_GPTE_OPENTLC_COM","default":2}
+{"level":"info","ts":1609951714.197674,"logger":"cmd","msg":"Environment variable not set; using default value","Namespace":"","envVar":"ANSIBLE_DEBUG_LOGS","ANSIBLE_DEBUG_LOGS":false}
+{"level":"info","ts":1609951714.1977038,"logger":"ansible-controller","msg":"Watching resource","Options.Group":"gpte.opentlc.com","Options.Version":"v1","Options.Kind":"Gitea"}
+{"level":"info","ts":1609951714.198269,"logger":"proxy","msg":"Starting to serve","Address":"127.0.0.1:8888"}
+{"level":"info","ts":1609951714.19839,"logger":"controller-runtime.manager","msg":"starting metrics server","path":"/metrics"}
+{"level":"info","ts":1609951714.198472,"logger":"controller-runtime.manager.controller.gitea-controller","msg":"Starting EventSource","source":"kind source: gpte.opentlc.com/v1, Kind=Gitea"}
+{"level":"info","ts":1609951714.300617,"logger":"controller-runtime.manager.controller.gitea-controller","msg":"Starting Controller"}
+{"level":"info","ts":1609951714.300652,"logger":"controller-runtime.manager.controller.gitea-controller","msg":"Starting workers","worker count":12}
+----
+
+. Leave the operator running and open a second shell to your bastion.
+. Create a new project to run your Gitea instance in
++
+[source,sh]
+----
+oc new-project gitea
+----
+
+. Create a Gitea custom resource:
++
+[source,sh]
+----
+echo "apiVersion: gpte.opentlc.com/v1
+kind: Gitea
+metadata:
+  name: repository
+spec:
+  giteaImageTag: 1.13.1
+  postgresqlVolumeSize: 4Gi
+  giteaVolumeSize: 4Gi
+  giteaSsl: True" > $HOME/gitea-operator/config/samples/gitea-server.yaml
+----
+
+. Create the Custom Resource
++
+[source,sh]
+----
+oc create -f $HOME/gitea-operator/config/samples/gitea-server.yaml -n gitea
+----
+
+. In the first window observe the operator code creating the application. You should see no errors.
++
+Once the operator finishes the deploy it usually runs through the playbook one more time because the reconcile period will have already passed. Again you should see no errors.
+
+. In the second window examine the Gitea custom resource:
++
+[source,sh]
+----
+oc get gitea repository -o yaml -n gitea
+----
++
+.Sample Output
+[source,texinfo]
+----
+[...]
+spec:
+  giteaImageTag: 1.13.1
+  giteaSsl: true
+  giteaVolumeSize: 4Gi
+  postgresqlVolumeSize: 4Gi
+status:
+  conditions:
+  - ansibleResult:
+      changed: 0
+      completion: 2020-11-17T20:19:00.686392
+      failures: 0
+      ok: 7
+      skipped: 0
+    lastTransitionTime: "2020-11-17T20:16:44Z"
+    message: Awaiting next reconciliation
+    reason: Successful
+    status: "True"
+    type: Running
+----
++
+You should see that the `ansibleResult` is successful.
+
+. Delete the gitea repository again.
++
+[source,sh]
+----
+oc delete gitea repository -n gitea
+----
+
+In the first window where the operator is running stop the operator by pressing `Ctrl-C`.
+
+== Build the operator container image
+
+Before you build the operator image you need to make a few adjustments to the project. When testing you ran the operator as a cluster admin. But when you run the opeator as a pod it uses the `default` service account in the project that it gets installed to. Because the operator needs to create/update/manipulate a number of Kubernetes objects you need to adjust the cluster role that grants the correct permissions to the operator pod.
+
+. Update the file config/rbac/role.yaml:
+
+* At the bottom of the file (below the line `# +kubebuilder:scaffold:rules`) add two more *apiGroups* sections.
+** Add a section with api group `""`,  resources: `serviceaccounts`, `persistentvolumeclaims`, `configmaps` and `services` and all the verbs.
+** The operator also creates a route for the application. Add a new section with api group `route.openshift.io`, resource `routes` and all the verbs.
++
+The final file should look like this:
++
+[source,sh]
+----
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+  ##
+  ## Base operator rules
+  ##
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+      - pods
+      - pods/exec
+      - pods/log
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+      - daemonsets
+      - replicasets
+      - statefulsets
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  ##
+  ## Rules for gpte.opentlc.com/v1, Kind: Gitea
+  ##
+  - apiGroups:
+      - gpte.opentlc.com
+    resources:
+      - giteas
+      - giteas/status
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+# +kubebuilder:scaffold:rules
+  - apiGroups:
+      - ""
+    resources:
+      - serviceaccounts
+      - persistentvolumeclaims
+      - configmaps
+      - services
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - route.openshift.io
+    resources:
+      - routes
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+----
+
+. By default the operator gets installed in project `gitea-operator-system`.
++
+Should you want to change the name of the project change the property `namespace` in the file `config/default/kustomization.yaml`. In this file you can also enable Prometheus monitoring for your operator.
+
+. Make sure you are logged into Quay (use `docker login` instead of `podman login` on macOS).
++
+[source,sh]
+----
+export QUAY_ID=<your quay id>
+podman login -u ${QUAY_ID} quay.io
+----
++
+.Sample Output
+[source,texinfo]
+----
+Password:
+Login Succeeded!
+----
+
+. To build on Linux with `podman` instead of `docker` make sure that docker is symlink to podman:
++
+[source,sh]
+----
+sudo ln -s $(which podman) /usr/bin/docker
+----
+
+. Build the operator container image
++
+[source,sh]
+----
+make docker-build IMG=quay.io/$QUAY_ID/gitea-operator:v1.0.0
+----
++
+.Sample Output
+[source,texinfo]
+----
+Sending build context to Docker daemon  120.3kB
+Step 1/6 : FROM quay.io/operator-framework/ansible-operator:v1.3.0
+v1.3.0: Pulling from operator-framework/ansible-operator
+d9e72d058dc5: Pull complete
+cca21acb641a: Pull complete
+1b475b71908b: Pull complete
+8921373a74a1: Pull complete
+cd93d9d9e241: Pull complete
+1339eac05503: Pull complete
+8845f94bc0c7: Pull complete
+Digest: sha256:68617fa46120cda6cdf61164df1b9cba15c33f535dee0f418773ff482b053194
+Status: Downloaded newer image for quay.io/operator-framework/ansible-operator:v1.3.0
+ ---> 1138a349cad0
+Step 2/6 : COPY requirements.yml ${HOME}/requirements.yml
+ ---> 4d25c82a8b6f
+Step 3/6 : RUN ansible-galaxy collection install -r ${HOME}/requirements.yml  && chmod -R ug+rwx ${HOME}/.ansible
+ ---> Running in 0c197cb55b39
+Process install dependency map
+Starting collection install process
+Installing 'community.kubernetes:0.11.1' to '/opt/ansible/.ansible/collections/ansible_collections/community/kubernetes'
+Installing 'operator_sdk.util:0.1.0' to '/opt/ansible/.ansible/collections/ansible_collections/operator_sdk/util'
+Removing intermediate container 0c197cb55b39
+ ---> b39304438607
+Step 4/6 : COPY watches.yaml ${HOME}/watches.yaml
+ ---> 1499b5df69e1
+Step 5/6 : COPY roles/ ${HOME}/roles/
+ ---> 7dce9f8ad4ea
+Step 6/6 : COPY playbooks/ ${HOME}/playbooks/
+ ---> 4c2494fb2051
+Successfully built 4c2494fb2051
+Successfully tagged quay.io/wkulhanek/gitea-operator:v1.0.0
+----
+
+. Push the image to the registry:
++
+[source,sh]
+----
+make docker-push IMG=quay.io/$QUAY_ID/gitea-operator:v1.0.0
+----
+
+. Make sure the repository `$QUAY_ID/gitea-operator` in Quay is public.
+
+== Add OpenAPIV3Schema Documentation to the Operator
+
+When using the operator users can specify settings for the deployed application using the `spec` of the Custom Resource (*Gitea*). It is advisable to add OpenAPIV3Schema compliant documentation to the Custom Resource Definition for the Gitea custom resource.
+
+You don't want to add this to the generated files - but rather patch in the documentation using `kustomize`. The base CRD definition can be found in `$HOME/gitea-operator/config/crd/bases/gpte.opentlc.com_giteas.yaml`. The associated *kustomization* file is `$HOME/gitea-operator/config/crd/kustomization.yaml`.
+
+. Create a directory to hold the patches file:
++
+[source,sh]
+----
+mkdir $HOME/gitea-operator/config/crd/patches
+----
+
+. Create the patches file (note that the patch is written in JSON format to fit into one line for the *value* of the patch, also note that `\\\\` will result in just `\\` in the resulting file):
++
+[source,sh]
+----
+cat << EOF >$HOME/gitea-operator/config/crd/patches/transformer-patches-openapi.yaml
+---
+apiVersion: builtin
+kind: PatchTransformer
+metadata:
+  name: add-openapi-docs
+target:
+  group: apiextensions.k8s.io
+  version: v1
+  kind: CustomResourceDefinition
+  name: giteas.gpte.opentlc.com
+patch: |-
+  - op: replace
+    path: /spec/versions/0/schema/openAPIV3Schema/properties/spec/properties
+    value: {"postgresqlVolumeSize":{"description":"Size of the Persistent Volume Claim for the PostgreSQL database. Default is '4Gi'.","type":"string"},"postgresql_image":{"description":"Container image for the PostgreSQL database. Default is 'registry.redhat.io/rhel8/postgresql-12'.","type":"string"},"postgresql_image_tag":{"description":"Image tag for the PostgreSQL container image. Default is 'latest'.","type":"string"},"postgresqlMemoryRequest":{"description":"Memory request for the PostgreSQL database. Default is '512Mi'.","type":"string"},"postgresqlMemoryLimit":{"description":"Memory limit for the PostgreSQL database. Default is '512Mi'.","type":"string"},"postgresqlCpuRequest":{"description":"CPU request for the PostgreSQL database. Default is '200m'.","type":"object","additionalProperties":{"anyOf":[{"type":"integer"},{"type":"string"}],"pattern":"^(\\\\+|-)?(([0-9]+(\\\\.[0-9]*)?)|(\\\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\\\+|-)?(([0-9]+(\\\\.[0-9]*)?)|(\\\\.[0-9]+))))?$","x-kubernetes-int-or-string":true}},"postgresqlCpuLimit":{"description":"CPU limit for the PostgreSQL database. Default is '500m'.","type":"object","additionalProperties":{"anyOf":[{"type":"integer"},{"type":"string"}],"pattern":"^(\\\\+|-)?(([0-9]+(\\\\.[0-9]*)?)|(\\\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\\\+|-)?(([0-9]+(\\\\.[0-9]*)?)|(\\\\.[0-9]+))))?$","x-kubernetes-int-or-string":true}},"giteaSsl":{"description":"Create an HTTPS terminated route for Gitea. Default is 'false'","type":"boolean"},"giteaRoute":{"description":"Specify the whole Route URL for the Gitea Route. Default is ''.","type":"string"},"giteaVolumeSize":{"description":"Size of the Persistent Volume Claim for Gitea. Default is '4Gi'.","type":"string"},"gitea_image":{"description":"Container image for Gitea. Default is 'quay.io/gpte-devops-automation/gitea'.","type":"string"},"gitea_image_tag":{"description":"Image tag for the Gitea container image. Default is 'latest'.","type":"string"},"giteaMemoryRequest":{"description":"Memory request for Gitea. Default is '1Gi'.","type":"string"},"giteaMemoryLimit":{"description":"Memory limit for Gitea. Default is '1Gi'.","type":"string"},"giteaCpuRequest":{"description":"CPU request for Gitea. Default is '200m'.","type":"object","additionalProperties":{"anyOf":[{"type":"integer"},{"type":"string"}],"pattern":"^(\\\\+|-)?(([0-9]+(\\\\.[0-9]*)?)|(\\\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\\\+|-)?(([0-9]+(\\\\.[0-9]*)?)|(\\\\.[0-9]+))))?$","x-kubernetes-int-or-string":true}},"giteaCpuLimit":{"description":"CPU limit for Gitea. Default is '500m'.","type":"object","additionalProperties":{"anyOf":[{"type":"integer"},{"type":"string"}],"pattern":"^(\\\\+|-)?(([0-9]+(\\\\.[0-9]*)?)|(\\\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\\\+|-)?(([0-9]+(\\\\.[0-9]*)?)|(\\\\.[0-9]+))))?$","x-kubernetes-int-or-string":true}}}
+EOF
+----
+
+. Add the patch to the file `kustomization.yaml` (only run this command once):
++
+[source,sh]
+----
+echo "transformers:
+- ./patches/transformer-patches-openapi.yaml" >> $HOME/gitea-operator/config/crd/kustomization.yaml
+----
+
+== Deploy the Operator to your cluster
+
+You can use the Operator SDK to deploy the operator to your cluster.
+
+. Again make sure that you are logged in as a user with `cluster-admin` privileges.
+. Deploy the operator to your cluster.
++
+[source,sh]
+----
+make deploy IMG=quay.io/$QUAY_ID/gitea-operator:v1.0.0
+----
++
+.Sample Output
+[source,sh]
+----
+cd config/manager && /Users/wkulhane/bin/kustomize edit set image controller=quay.io/wkulhanek/gitea-operator:v1.0.0
+/Users/wkulhane/bin/kustomize build config/default | kubectl apply -f -
+namespace/gitea-operator-system created
+customresourcedefinition.apiextensions.k8s.io/giteas.gpte.opentlc.com unchanged
+role.rbac.authorization.k8s.io/gitea-operator-leader-election-role created
+clusterrole.rbac.authorization.k8s.io/gitea-operator-manager-role created
+clusterrole.rbac.authorization.k8s.io/gitea-operator-metrics-reader created
+clusterrole.rbac.authorization.k8s.io/gitea-operator-proxy-role created
+rolebinding.rbac.authorization.k8s.io/gitea-operator-leader-election-rolebinding created
+clusterrolebinding.rbac.authorization.k8s.io/gitea-operator-manager-rolebinding created
+clusterrolebinding.rbac.authorization.k8s.io/gitea-operator-proxy-rolebinding created
+service/gitea-operator-controller-manager-metrics-service created
+deployment.apps/gitea-operator-controller-manager created
+----
+
+. Find the operator pod:
++
+[source,sh]
+----
+oc get pod -n gitea-operator-system
+----
++
+.Sample Output
+[source,texinfo]
+----
+NAME                                                 READY   STATUS    RESTARTS   AGE
+gitea-operator-controller-manager-65497c4564-z6x4m   2/2     Running   0          67s
+----
+
+. Tail the logs of the `manager` container in your operator pod:
++
+[source,sh]
+----
+oc logs -f gitea-operator-controller-manager-65497c4564-z6x4m -c manager -n gitea-operator-system
+----
+
+. In a second window re-create your gitea custom resource `repository`.
++
+[source,sh]
+----
+oc create -f $HOME/gitea-operator/config/samples/gitea-server.yaml -n gitea
+----
+
+. Observe the logs from the operator. Once again there should be no errors.
++
+Should you get permission errors make sure you double check the `role.yaml`.
++
+[TIP]
+====
+If you need to make adjustments to the role you can just redeploy the operator after you made your changes:
+
+[source,sh]
+----
+make deploy IMG=quay.io/$QUAY_ID/gitea-operator:v1.0.0
+----
+====
+
+. Your operator is now running on the cluster and managing Giteas for the whole cluster.
++
+Clean up the Gitea repository and operator before proceeding to the next section:
++
+[source,sh]
+----
+oc delete -f $HOME/gitea-operator/config/samples/gitea-server.yaml -n gitea
+oc delete project gitea
+make undeploy IMG=quay.io/$QUAY_ID/gitea-operator:v1.0.0
+----
+
+== Operator Lifecycle manager
+
+In this section you create the artifacts necessary to surface your operator in the OperatorHub on your cluster. This allows cluster administrators to install the operator into your cluster using the Operator Lifecycle Manager.
+
+=== Update the Gitea sample to be displayed in OLM
+
+When a new Gitea custom resource is created via the OLM an example is displayed for the user. The default example is not particularly useful.
+
+Update the Sample to be displayed when creating a Gitea from OLM:
+
+[source,sh]
+----
+echo "apiVersion: gpte.opentlc.com/v1
+kind: Gitea
+metadata:
+  name: repository
+spec:
+  postgresqlVolumeSize: 4Gi
+  giteaVolumeSize: 4Gi
+  giteaSsl: True" > $HOME/gitea-operator/config/samples/gpte_v1alpha1_gitea.yaml
+----
+
+=== Add the Gitea Logo for the Operator Bundle
+
+. Download the Gitea Logo from the Gitea web site
++
+[source,sh]
+----
+wget -O /tmp/gitea.svg https://github.com/go-gitea/gitea/raw/master/assets/logo.svg
+----
+
+. base64 encode the logo file (this results in one very long line):
++
+[source,sh]
+----
+base64 --wrap=0 /tmp/gitea.svg > $HOME/gitea-operator/gitea-base64.svg
+----
+
+[NOTE] There *should* be a way to do this via kustomize - but I have not found a way to do it...
+
+. Edit the file $HOME/gitea-operator/config/manifests/bases/gitea-operator.clusterserviceversion.yaml.
+.. Change the lines `/spec/icon/base64data` and add the contents of the file `$HOME/gitea-operator/gitea-base64.svg`.
+.. Change the value of `/spec/icon/mediatype` to `image/svg+xml`
+.. Change the value of `/spec/maturity` from *alpha* to *stable*
+. Save the file.
+
+=== Create the Operator Bundle
+
+. First install `kustomize` (if you don't then the first time the `make bundle` command is run the tool will be installed for you):
++
+[source,sh]
+----
+wget https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv3.9.1/kustomize_v3.9.1_linux_amd64.tar.gz
+tar -xzvf kustomize_v3.9.1_linux_amd64.tar.gz
+sudo chown root:root ./kustomize
+sudo mv ./kustomize /usr/local/bin
+rm kustomize_v3.9.1_linux_amd64.tar.gz
+----
+
+. Make sure you're logged into the cluster as a cluster-admin.
+. Create the operator bundle. The bundle contains a number of YAML manifests that describe your operator.
++
+[source,sh]
+----
+cd $HOME/gitea-operator
+make bundle CHANNELS=stable DEFAULT_CHANNEL=stable VERSION=1.0.0 IMG=quay.io/$QUAY_ID/gitea-operator:v1.0.0
+----
++
+.Sample Output
+[source,texinfo]
+----
+operator-sdk generate kustomize manifests -q
+
+Display name for the operator (required):
+> Gitea Operator
+
+Description for the operator (required):
+> Gitea Operator - provided by Red Hat GPTE
+
+Provider's name for the operator (required):
+> Red Hat GPTE
+
+Any relevant URL for the provider name (optional):
+> www.redhat.com/partners
+
+Comma-separated list of keywords for your operator (required):
+> gitea,repository
+
+Comma-separated list of maintainers and their emails (e.g. 'name1:email1, name2:email2') (required):
+> Wolfgang Kulhanek:wkulhane@redhat.com
+
+cd config/manager && /Users/wkulhane/bin/kustomize edit set image controller=quay.io/wkulhanek/gitea-operator:v1.0.0
+/Users/wkulhane/bin/kustomize build config/manifests | operator-sdk generate bundle -q --overwrite --version 1.0.0
+INFO[0000] Building annotations.yaml
+INFO[0000] Writing annotations.yaml in /Users/wkulhane/Development/operators/gitea-operator/bundle/metadata
+INFO[0000] Building Dockerfile
+INFO[0000] Writing bundle.Dockerfile in /Users/wkulhane/Development/operators/gitea-operator
+operator-sdk bundle validate ./bundle
+INFO[0000] Found annotations file                        bundle-dir=bundle container-tool=docker
+INFO[0000] Could not find optional dependencies file     bundle-dir=bundle container-tool=docker
+INFO[0000] All validation tests have completed successfully
+----
+
+. Build the bundle container image. This wraps all the generated YAML manifests into an OCI compliant container image. This container image is much easier to maintain than a bunch of YAML files (on macOS use `docker` instead of `podman`).
++
+[source,sh]
+----
+make bundle-build BUNDLE_CHANNELS=stable BUNDLE_DEFAULT_CHANNEL=stable VERSION=1.0.0 BUNDLE_IMG=quay.io/$QUAY_ID/gitea-operator-bundle:v1.0.0
+----
+
+. Push the bundle image to the Quay registry and then validate that it looks correct (on macOS use `docker` instead of `podman`).
++
+[source,sh]
+----
+podman push quay.io/$QUAY_ID/gitea-operator-bundle:v1.0.0
+operator-sdk bundle validate quay.io/$QUAY_ID/gitea-operator-bundle:v1.0.0 --image-builder podman
+----
+
+. The next step is to create a catalog index image. There is a dedicated tool that helps with adding bundle images into an index image.
++
+Download and install the `opm` tool:
++
+.Linux (simple approach)
+[source,sh]
+----
+export OPM_RELEASE=v1.15.3
+
+curl -L https://github.com/operator-framework/operator-registry/releases/download/${OPM_RELEASE}/linux-amd64-opm -o ./opm
+
+chmod +x ./opm
+sudo chown root:root ./opm
+sudo mv opm /usr/local/bin/opm
+----
++
+.macOS
+[source,sh]
+----
+export OPM_RELEASE=v1.15.3
+
+curl -L https://github.com/operator-framework/operator-registry/releases/download/$OPM_RELEASE/darwin-amd64-opm -o ./opm
+
+chmod +x ./opm
+mv opm ~/bin/opm
+----
++
+[NOTE]
+====
+On Linux the preferred way is to extract the `opm` tool from the officially built image for the version of your OpenShift cluster.
+
+Create a file `auth.json` with your pull secret for the Red Hat registries. You can get that secret at https://try.openshift.com. Extract the opm tool from the most recent OpenShift operator registry image:
+
+[source,sh]
+----
+REG_CREDS=./auth.json
+oc image extract registry.redhat.io/openshift4/ose-operator-registry:v4.6 -a ${REG_CREDS} --path /usr/bin/opm:. --confirm
+chmod +x ./opm
+sudo chown root:root ./opm
+sudo mv ./opm /usr/local/bin/opm
+----
+====
+
+. Set your Quay ID and make sure you are still logged into Quay (on macOS use `docker` instead of `podman`):
++
+[source,sh]
+----
+export QUAY_ID=<your quay id>
+podman login -u $QUAY_ID quay.io
+----
+
+. Create the index image - this image contains just the bundle image for the gitea operator:
++
+[NOTE]
+On macOS you need to add the parameter `--container-tool docker` because `podman` does not exist for on macOS.
++
+[source,sh]
+----
+opm index add \
+    --bundles quay.io/$QUAY_ID/gitea-operator-bundle:v1.0.0 \
+    --tag quay.io/$QUAY_ID/gitea-catalog:v1.0.0
+----
++
+.Sample Output
+[source,texinfo]
+----
+INFO[0000] building the index                            bundles="[quay.io/wkulhanek/gitea-operator-bundle:v1.0.0]"
+INFO[0000] resolved name: quay.io/wkulhanek/gitea-operator-bundle:v1.0.0
+INFO[0000] fetched                                       digest="sha256:b1a2e8d78ef9513e6980c29c8b54e659be115f793eb3630f433371b2cbe2e8dd"
+INFO[0000] fetched                                       digest="sha256:3f75b985b4221a8fb59239f41b51fc05f78874ab4b9e4a27997833926c620301"
+INFO[0000] fetched                                       digest="sha256:e4173a45a843c37c0538b9dba65960130893eeb798e6bfb82e2b2262b1007378"
+INFO[0000] fetched                                       digest="sha256:32ab44bbd7ebca8411149f4142fc0391ef7a9a64ca18dfe125c3bc545bc1cba4"
+INFO[0000] fetched                                       digest="sha256:5755caaf5a71771753cbbfe48afb9ee7dde128c79841a7d8af4fee56b160413c"
+INFO[0000] unpacking layer: {application/vnd.docker.image.rootfs.diff.tar.gzip sha256:e4173a45a843c37c0538b9dba65960130893eeb798e6bfb82e2b2262b1007378 2935 [] map[] <nil>}
+INFO[0000] unpacking layer: {application/vnd.docker.image.rootfs.diff.tar.gzip sha256:5755caaf5a71771753cbbfe48afb9ee7dde128c79841a7d8af4fee56b160413c 370 [] map[] <nil>}
+INFO[0000] unpacking layer: {application/vnd.docker.image.rootfs.diff.tar.gzip sha256:3f75b985b4221a8fb59239f41b51fc05f78874ab4b9e4a27997833926c620301 449 [] map[] <nil>}
+INFO[0000] Could not find optional dependencies file     dir=bundle_tmp699124974 file=bundle_tmp699124974/metadata load=annotations
+INFO[0000] found csv, loading bundle                     dir=bundle_tmp699124974 file=bundle_tmp699124974/manifests load=bundle
+INFO[0000] loading bundle file                           dir=bundle_tmp699124974/manifests file=gitea-operator-controller-manager-metrics-service_v1_service.yaml load=bundle
+INFO[0000] loading bundle file                           dir=bundle_tmp699124974/manifests file=gitea-operator-metrics-reader_rbac.authorization.k8s.io_v1_clusterrole.yaml load=bundle
+INFO[0000] loading bundle file                           dir=bundle_tmp699124974/manifests file=gitea-operator.clusterserviceversion.yaml load=bundle
+INFO[0000] loading bundle file                           dir=bundle_tmp699124974/manifests file=gpte.opentlc.com_giteas.yaml load=bundle
+INFO[0000] Generating dockerfile                         bundles="[quay.io/wkulhanek/gitea-operator-bundle:v1.0.0]"
+INFO[0000] writing dockerfile: index.Dockerfile048851804  bundles="[quay.io/wkulhanek/gitea-operator-bundle:v1.0.0]"
+INFO[0000] running podman build                          bundles="[quay.io/wkulhanek/gitea-operator-bundle:v1.0.0]"
+INFO[0000] [podman build --format docker -f index.Dockerfile048851804 -t quay.io/wkulhanek/gitea-catalog:v1.0.0 .]  bundles="[quay.io/wkulhanek/gitea-operator-bundle:v1.0.0]"
+----
+
+. Push the catalog image to the Quay repository (on macOS use `docker` instead of `podman`):
++
+[source,sh]
+----
+podman push quay.io/$QUAY_ID/gitea-catalog:v1.0.0
+----
+
+. Make sure that the repos `gitea-catalog`, `gitea-operator-bundle` and `gitea-operator` in your Quay account are public.
+
+== Create the Catalog Source in the cluster
+
+. In order to use the catalog image from your OpenShift cluster you need to create a catalog source that points to your index image. `openshift-marketplace` is a good project to collect your catalog sources.
++
+[source,sh]
+----
+echo "apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: redhat-gpte
+  namespace: openshift-marketplace
+spec:
+  sourceType: grpc
+  image: quay.io/$QUAY_ID/gitea-catalog:v1.0.0
+  displayName: Red Hat GPTE" > $HOME/gitea-operator/catalog_source.yaml
+----
+
+. Create the Catalog Source in the cluster
++
+[source,sh]
+----
+oc create -f $HOME/gitea-operator/catalog_source.yaml
+----
+
+. Log into the OpenShift Web Console, create a new project, navigate to the Operator Hub and you should see the new "Provider Type" and the Gitea Operator in the list of operators.
+
+. You can now deploy the operator from the Operator Hub.
